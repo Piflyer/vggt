@@ -1,0 +1,136 @@
+# Configuration for training VGGT with a subset of Rosbag data
+# Focuses on frames 1300-1811
+
+defaults:
+  - default.yaml
+
+exp_name: vggt_ros_full_high_fidelity_finetune-LR-5-adjusted
+img_size: 518
+num_workers: 8
+seed_value: 42
+accum_steps: 16
+patch_size: 14
+val_epoch_freq: 5
+max_img_per_gpu: 4  # Reduced to 4 to avoid OOM
+lr: 1e-5             # Lower LR for backbone stability
+checkpoint:
+  resume_checkpoint_path: "/home/tim/vggt-cubify/vggt/models/model.pt"
+  # resume_checkpoint_path: "/home/tim/vggt-cubify/vggt/training/logs/vggt_ros_subset_7400_13000_high_fidelity_test11_sparkal_alignment_finetune/ckpts/checkpoint.pt"
+  load_weights_only: True
+  strict: False
+
+limit_train_batches: 400
+limit_val_batches: 50
+max_epochs: 40
+img_nums: [4, 8]
+
+logging:
+  log_dir: logs/${exp_name}
+
+data:
+  train:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    pin_memory: True
+    persistent_workers: True
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      img_nums: ${img_nums}
+      debug: False
+      repeat_batch: False
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.cubifyanything_extracted.CubifyAnythingExtractedDataset
+          split: train
+          DATA_ROOT: "/home/tim/vggt-cubify/ml-cubifyanything/data/extracted/rosbag-5-full-fixed/train"
+          min_num_images: 4
+          len_train: 6872
+          load_arkit_depth: True
+          apply_dust3r_normalization: False
+          rescale_translation_mm_to_m: False
+          max_depth: 50.0
+          background_depth: 50.0
+          
+  val:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    pin_memory: True
+    persistent_workers: True
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      img_nums: ${img_nums}
+      debug: False
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.cubifyanything_extracted.CubifyAnythingExtractedDataset
+          split: val
+          DATA_ROOT: "/home/tim/vggt-cubify/ml-cubifyanything/data/extracted/rosbag-5-full-fixed/val"
+          min_num_images: 4
+          len_train: 859
+          len_test: 859
+          load_arkit_depth: True
+          apply_dust3r_normalization: False
+          rescale_translation_mm_to_m: False
+          max_depth: 50.0
+          background_depth: 50.0
+
+model:
+  _target_: vggt.models.vggt.VGGT
+  enable_camera: True
+  enable_depth: True
+  enable_point: False
+  enable_track: False
+
+loss:
+  _target_: loss.MultitaskLoss
+  camera: 
+    weight: 5.0
+    loss_type: "l1"
+  depth:
+    weight: 1.0
+    gradient_loss_fn: "grad" 
+    valid_range: 0.98
+    gamma: 0.0
+    alpha: 0.0
+
+optim:  
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: ${lr}
+    weight_decay: 0.05
+
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      - module_name: ["aggregator"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["camera_head"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["depth_head"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["*"]
+        max_norm: 1.0
+        norm_type: 2
+
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-8
+              end_value: ${lr}
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: ${lr}
+              end_value: 1e-8
+          lengths: [0.15, 0.85]
+          interval_scaling: ['rescaled', 'rescaled']

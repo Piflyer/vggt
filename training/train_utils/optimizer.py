@@ -68,13 +68,13 @@ def validate_param_group_params(param_groups: List[Dict], model: nn.Module):
         assert len(pg["params"]) == len(set(pg["params"]))
 
     parameters = [set(pg["params"]) for pg in param_groups]
-    model_parameters = {p for _, p in model.named_parameters()}
+    model_parameters = {p for _, p in model.named_parameters() if p.requires_grad}
 
     for p1, p2 in itertools.permutations(parameters, 2):
         assert p1.isdisjoint(p2), "Parameter groups should be disjoint"
 
     assert set.union(*parameters) == model_parameters, (
-        "Parameter groups must cover ALL model parameters "
+        "Parameter groups must cover ALL trainable model parameters "
         f"(found {len(set.union(*parameters))} / {len(model_parameters)})"
     )
 
@@ -215,7 +215,8 @@ def construct_optimizer(model: nn.Module,
     *No* allowlist handling – we always optimize *all* model parameters.
     """
 
-    named_parameters = dict(model.named_parameters())
+    # named_parameters = dict(model.named_parameters())
+    named_parameters = {k: v for k, v in model.named_parameters() if v.requires_grad}
     all_parameter_names = set(named_parameters.keys())
     module_cls_to_all_param_names = get_module_cls_to_param_names(model)
 
@@ -223,7 +224,8 @@ def construct_optimizer(model: nn.Module,
     # No scheduler case – simple & fast
     # ──────────────────────────────────────────────────────────────────
     if not options_conf:
-        optimizer = hydra.utils.instantiate(optimizer_conf, named_parameters.values())
+        # optimizer = hydra.utils.instantiate(optimizer_conf, named_parameters.values())
+        optimizer = hydra.utils.instantiate(optimizer_conf, list(named_parameters.values()))
         return OptimizerWrapper(optimizer)
 
     # ──────────────────────────────────────────────────────────────────

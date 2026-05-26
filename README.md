@@ -8,64 +8,246 @@
 <a href="https://vgg-t.github.io/"><img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page"></a>
 <a href="https://huggingface.co/spaces/facebook/vggt"><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Demo-blue'></a>
 
-
 **[Visual Geometry Group, University of Oxford](https://www.robots.ox.ac.uk/~vgg/)**; **[Meta AI](https://ai.facebook.com/research/)**
-
 
 [Jianyuan Wang](https://jytime.github.io/), [Minghao Chen](https://silent-chen.github.io/), [Nikita Karaev](https://nikitakaraevv.github.io/), [Andrea Vedaldi](https://www.robots.ox.ac.uk/~vedaldi/), [Christian Rupprecht](https://chrirupp.github.io/), [David Novotny](https://d-novotny.github.io/)
 </div>
 
-```bibtex
-@inproceedings{wang2025vggt,
-  title={VGGT: Visual Geometry Grounded Transformer},
-  author={Wang, Jianyuan and Chen, Minghao and Karaev, Nikita and Vedaldi, Andrea and Rupprecht, Christian and Novotny, David},
-  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
-  year={2025}
-}
+---
+
+# 🚀 VGGT Rosbag & Depth-Anything-3 Fine-Tuning Extension
+
+This repository has been extended to support a complete pipeline for **fine-tuning VGGT camera tracking and depth estimation on custom ROS bag data**. It features a robust multi-view conversion pipeline, metric ground truth depth estimation via **Depth-Anything-3**, custom dataloaders, and trainer enhancements to ensure stable convergence on lower-resource GPUs.
+
+```mermaid
+graph LR
+    A[Raw ROS Bag] --> B[Data Extraction]
+    B --> C[DA3 Depth GT Generation]
+    C --> D[VGGT Fine-Tuning]
+    D --> E[Trajectory Validation]
 ```
 
-## Updates
+## Table of Contents
+0. [Outdoor Depth & VGGT-Omega Fine-Tuning Tips](#0-outdoor-depth--vggt-omega-fine-tuning-tips)
+1. [Data Extraction & Conversion (ROS Bag to Multi-View Format)](#1-data-extraction--conversion-ros-bag-to-multi-view-format)
+2. [Ground Truth Metric Depth Generation (Depth-Anything-3)](#2-ground-truth-metric-depth-generation-depth-anything-3)
+3. [Core Training & Dataloader Enhancements](#3-core-training--dataloader-enhancements)
+4. [Fine-Tuning Execution](#4-fine-tuning-execution)
+5. [Trajectory Visualization & Validation](#5-trajectory-visualization--validation)
+6. [Repository Code Layout](#6-repository-code-layout)
 
-- [May 18, 2026] The next step of VGGT — **VGGT-Omega** — has been released! Check it out at [https://vggt-omega.github.io/](https://vggt-omega.github.io/).
+---
 
+## 0. Outdoor Depth & VGGT-Omega Fine-Tuning Tips
 
-- [May 15, 2026] We fixed an implementation issue that was keeping redundant intermediate tensors in memory. With the same GPU memory budget, VGGT can now run on roughly 2-3x more input frames! See [VGGT-Omega](https://vggt-omega.github.io/) for more details.
+Fine-tuning spatial transformers on raw **outdoor datasets** presents severe visual and geometric challenges. Long-range horizons, complex foliage, dynamic lighting, and highly **sparse/poor active LiDAR depth readings** can easily destabilize camera tracking and depth convergence. 
 
+To overcome these, this pipeline adopts the **fine-tuning best practices pioneered by VGGT-Omega**:
 
+### A. Foundation Model Distillation for Dense Depth
+Outdoor LiDAR often provides sparse points or fails on highly reflective/absorbent surfaces (e.g. water, glass, distant skies). Rather than supervising on noisy or sparse physical depth, we use **Depth-Anything-3** (`DA3NESTED-GIANT-LARGE`) to distill dense, temporally consistent, metric depth ground-truth maps offline.
 
-- [July 29, 2025] We've updated the license for VGGT to permit **commercial use** (excluding military applications). All code in this repository is now under a commercial-use-friendly license. However, only the newly released checkpoint [**VGGT-1B-Commercial**](https://huggingface.co/facebook/VGGT-1B-Commercial) is licensed for commercial usage — the original checkpoint remains non-commercial. Full license details are available [here](https://github.com/facebookresearch/vggt/blob/main/LICENSE.txt). Access to the checkpoint requires completing an application form, which is processed by a system similar to LLaMA's approval workflow, automatically. The new checkpoint delivers similar performance to the original model. Please submit an issue if you notice a significant performance discrepancy.
+### B. Sky-Masking & Infinite Capping
+As recommended in VGGT-Omega's training protocols, attempts to learn depth for distant skies leads to massive gradient spikes. We isolate sky pixels using ONNX-based semantic masks and cap depth values at a constant background range (**50.0 meters**), directing model gradients away from unlearnable infinite space.
 
+### C. Catastrophic Forgetting Mitigation (Feature Freezing)
+To preserve the excellent zero-shot generic geometry representations learned by the Visual Geometry Grounded Transformer, we freeze the core patch aggregator:
+```bash
+# Add --freeze_aggregator to retain general visual representations
+python training/finetune_cubifyanything.py --freeze_aggregator ...
+```
+This forces backpropagation to exclusively adapt the lightweight tracking/camera and depth heads to the custom camera trajectory distribution, preventing catastrophic geometry forgetting.
 
+### D. AMP Scaler Backoff & NaN Resilience
+Outdoor trajectories can experience high-frequency VIO noise, causing massive gradients. The custom training loop implements an **AMP Scaler backoff check** which automatically catches infinite/NaN loss, zeros the optimizer, decreases the scale factor, and skips the batch gracefully instead of crashing the training process.
 
-- [July 6, 2025] Training code is now available in the `training` folder, including an example to finetune VGGT on a custom dataset. 
+---
 
+## 1. Data Extraction & Conversion (ROS Bag to Multi-View Format)
 
-- [June 13, 2025] Honored to receive the Best Paper Award at CVPR 2025! Apologies if I’m slow to respond to queries or GitHub issues these days. If you’re interested, our oral presentation is available [here](https://docs.google.com/presentation/d/1JVuPnuZx6RgAy-U5Ezobg73XpBi7FrOh/edit?usp=sharing&ouid=107115712143490405606&rtpof=true&sd=true). Another long presentation can be found [here](https://docs.google.com/presentation/d/1aSv0e5PmH1mnwn2MowlJIajFUYZkjqgw/edit?usp=sharing&ouid=107115712143490405606&rtpof=true&sd=true) (Note: it’s shared in .pptx format with animations — quite large, but feel free to use it as a template if helpful.)
+The training pipeline uses folder-based multi-view structures containing synchronized images, intrinsic camera parameters (`k`), and extrinsic camera poses (`rt`). The primary tool for raw dataset generation is:
+`tools/convert_rosbag_to_cubify_extracted.py`
 
+### Spatial odometry calibration and alignment
+Because mobile robot odometry (e.g., from VIO/Kimera) is represented in a different spatial coordinate system than the camera's optical frame, the script automatically applies a motion alignment matrix:
 
-- [June 2, 2025] Added a script to run VGGT and save predictions in COLMAP format, with bundle adjustment support optional. The saved COLMAP files can be directly used with [gsplat](https://github.com/nerfstudio-project/gsplat) or other NeRF/Gaussian splatting libraries.
+```python
+# Force Camera Forward (Z) to point along the Robot Motion Axis
+R_MOTION_ALIGNED = np.array([
+    [ 1,  0,  0, 0],
+    [ 0,  0, -1, 0],
+    [ 0,  1,  0, 0],
+    [ 0,  0,  0, 1]
+], dtype=np.float32)
+```
 
+### Execution Command:
+```bash
+python tools/convert_rosbag_to_cubify_extracted.py \
+    --bag /path/to/raw_odometry.bag \
+    --output-root ml-cubifyanything/data/extracted/rosbag \
+    --color-topic /sparkal1/forward/color/image_raw/compressed \
+    --depth-topic /sparkal1/forward/depth/image_rect_raw \
+    --pose-topic /sparkal1/kimera_vio_ros/odometry \
+    --min_disparity 10.0 \
+    --downsample 1
+```
+*   `--min_disparity`: Triggers optical flow keyframe selection, saving frames only when enough pixel displacement has occurred to prevent sequence stagnation.
+*   `--no-lidar` / `--allow-no-depth`: Allows running the extraction process on color-only ROS bags.
 
-- [May 3, 2025] Evaluation code for reproducing our camera pose estimation results on Co3D is now available in the [evaluation](https://github.com/facebookresearch/vggt/tree/evaluation) branch. 
+---
 
+## 2. Ground Truth Metric Depth Generation (Depth-Anything-3)
 
-## Overview
+To fine-tune VGGT depth predictions without active physical LiDAR sensors, the pipeline leverages the **Depth-Anything-3** (`DA3NESTED-GIANT-LARGE`) transformer to generate metric depth maps offline.
+This is implemented in `depth_anything_3/generate_depths.py` and uses two key stages:
 
-Visual Geometry Grounded Transformer (VGGT, CVPR 2025) is a feed-forward neural network that directly infers all key 3D attributes of a scene, including extrinsic and intrinsic camera parameters, point maps, depth maps, and 3D point tracks, **from one, a few, or hundreds of its views, within seconds**.
+### A. Sky Segmentation Masking
+Learning metric depth in infinite space (e.g. skies/horizons) causes model gradients to explode. We use `skyseg.onnx` to isolate pixels corresponding to the sky and hardcode their depth values to a background limit (50.0 meters):
 
+```python
+# Apply Sky Masking to prevent learning metric depth for infinite space
+sky_mask = segment_sky(image_path, skyseg_session, mask_filename=mask_path)
+depth[sky_mask < 128] = 50.0  # Cap sky depth at 50 meters
+```
 
-## Quick Start
+### B. Dynamic Intrinsic Rescaling
+When resizing the generated depth maps to match VGGT's standard target training resolution (`640x480`), we dynamically rescale the camera K-matrix parameters (`fx`, `fy`, `cx`, `cy`) to ensure mathematical consistency:
+
+```python
+# Scaling focal lengths and principal points to match target resolution
+scale_w = target_w / depth.shape[1]
+scale_h = target_h / depth.shape[0]
+intrinsics[0, 0] *= scale_w  # fx
+intrinsics[1, 1] *= scale_h  # fy
+intrinsics[0, 2] *= scale_w  # cx
+intrinsics[1, 2] *= scale_h  # cy
+```
+
+### Execution Command:
+```bash
+python depth_anything_3/generate_depths.py
+```
+This script will parse the extracted `.wide` folder trees, segment skies, run DA3 metric inference, and save identical metric `uint16` depth maps in both the wide and ground truth directories.
+
+---
+
+## 3. Core Training & Dataloader Enhancements
+
+Training feed-forward visual geometry transformers requires long sequences and is highly sensitive to training instabilities. We introduced three critical reliability improvements:
+
+### A. GPU Memory Leak Prevention
+During gradient accumulation, intermediate tensors tend to remain in CUDA memory. The trainer actively clears cache blocks at the end of each backward pass and validation step:
+```python
+# Freeing sequence tensors from GPU memory
+del batch
+torch.cuda.empty_cache()
+```
+
+### B. NaN / Inf Loss Fallback Loop
+When gradient scaling spikes or sequences contain unstable configurations, standard PyTorch training crashes. We implemented a robust skip-and-backoff mechanism:
+```python
+try:
+    self._run_steps_on_batch_chunks(chunked_batches, phase, loss_meters)
+except RuntimeError as e:
+    if "Loss is" in str(e) and "attempting to stop" in str(e):
+        logging.error(f"⚠️  SKIPPING BATCH due to NaN/Inf loss: {e}")
+        # Back off the gradient scaler to reduce optimization steps gracefully
+        current_scale = self.scaler.get_scale()
+        self.scaler.update(new_scale=current_scale * self.scaler.get_backoff_factor())
+        
+        # Zero out optimizers to clear bad gradients
+        for optim in self.optims:
+            optim.zero_grad()
+        continue
+    else:
+        raise e
+```
+
+---
+
+## 4. Fine-Tuning Execution
+
+To begin fine-tuning camera tracking and depth estimation on your extracted rosbag sequences:
+
+### Execution Command:
+```bash
+python training/finetune_cubifyanything.py \
+    --checkpoint /path/to/pretrained_vggt.pth \
+    --train_tars "ml-cubifyanything/data/extracted/rosbag/*" \
+    --epochs 30 \
+    --batch_size 12 \
+    --lr 2e-5 \
+    --num_workers 4 \
+    --exp_name vggt_tracking_rosbag
+```
+
+Configuration details, including batch sequences, loss weights, and frozen modules can be adjusted in:
+`training/config/cubifyanything_vggt_fixed.yaml`
+
+---
+
+## 5. Trajectory Visualization & Validation
+
+Once training completes, you can inspect loaded weights, plot trajectory normalizations, and evaluate prediction errors against ground truth coordinates.
+
+*   **Plotting Ground Truth Poses**:
+    ```bash
+    python notebooks/visualize_camera_poses.py
+    ```
+*   **Comparing Predicted Trajectories to GT**:
+    ```bash
+    python notebooks/visualize_predicted_vs_gt_poses.py
+    ```
+*   **Interactive Analysis**:
+    Open the Jupyter Notebook `notebooks/VGGT_Checkpoint_Verification_UPDATED.ipynb` to dynamically check trajectory scaling, coordinate projection metrics, and visualize camera poses.
+
+---
+
+## 6. Repository Code Layout
+
+This snapshot extends the native VGGT structure as follows:
+
+```
+vggt-rosbag-snapshot/
+├── tools/
+│   ├── convert_rosbag_to_cubify_extracted.py   # Main ROS bag translator
+│   ├── convert_kimera_to_vggt.py               # Kimera VIO pose alignment
+│   └── compare_datasets.py                     # Data structure verification
+├── depth_anything_3/
+│   └── generate_depths.py                      # DA3 depth GT generator
+├── training/
+│   ├── finetune_cubifyanything.py              # Configuration compiler & runner
+│   ├── trainer.py [MODIFIED]                   # Memory-safe, NaN-resilient trainer
+│   ├── loss.py [MODIFIED]                      # Trajectory and depth loss functions
+│   ├── config/
+│   │   ├── default.yaml [MODIFIED]             # Base Hydra configurations
+│   │   └── cubifyanything_vggt_fixed.yaml      # Specific rosbag yaml configs
+│   └── data/
+│       ├── pose_normalizer.py                  # Coordinate centering and scaling
+│       ├── collate.py                          # Multi-sequence collator
+│       ├── dynamic_dataloader.py [MODIFIED]     # Safety sequence checking dataloader
+│       └── datasets/
+│           └── cubifyanything_extracted.py     # Extracted folder-based dataset
+├── notebooks/
+│   ├── VGGT_Checkpoint_Verification_UPDATED.ipynb  # Interactive verification
+│   ├── visualize_camera_poses.py               # Render 3D paths
+│   └── visualize_predicted_vs_gt_poses.py      # Predicted vs GT trajectory plotter
+```
+
+---
+
+*For original VGGT documentation, quick-start setup, Gradio demos, and COLMAP export features, see below.*
+
+---
+
+## Original VGGT Quick Start & Details
 
 First, clone this repository to your local machine, and install the dependencies (torch, torchvision, numpy, Pillow, and huggingface_hub). 
 
 ```bash
-git clone git@github.com:facebookresearch/vggt.git 
-cd vggt
 pip install -r requirements.txt
 ```
-
-Alternatively, you can install VGGT as a package (<a href="docs/package.md">click here</a> for details).
-
 
 Now, try the model with just a few lines of code:
 
@@ -75,209 +257,19 @@ from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-# bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+) 
 dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
-# Initialize the model and load the pretrained weights.
-# This will automatically download the model weights the first time it's run, which may take a while.
 model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
 
-# Load and preprocess example images (replace with your own image paths)
 image_names = ["path/to/imageA.png", "path/to/imageB.png", "path/to/imageC.png"]  
 images = load_and_preprocess_images(image_names).to(device)
 
 with torch.no_grad():
     with torch.cuda.amp.autocast(dtype=dtype):
-        # Predict attributes including cameras, depth maps, and point maps.
         predictions = model(images)
 ```
 
-The model weights will be automatically downloaded from Hugging Face. If you encounter issues such as slow loading, you can manually download them [here](https://huggingface.co/facebook/VGGT-1B/blob/main/model.pt) and load, or:
-
-```python
-model = VGGT()
-_URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
-```
-
-## Detailed Usage
-
-<details>
-<summary>Click to expand</summary>
-
-You can also optionally choose which attributes (branches) to predict, as shown below. This achieves the same result as the example above. This example uses a batch size of 1 (processing a single scene), but it naturally works for multiple scenes.
-
-```python
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-from vggt.utils.geometry import unproject_depth_map_to_point_map
-
-with torch.no_grad():
-    with torch.cuda.amp.autocast(dtype=dtype):
-        images = images[None]  # add batch dimension
-        aggregated_tokens_list, ps_idx = model.aggregator(images)
-                
-    # Predict Cameras
-    pose_enc = model.camera_head(aggregated_tokens_list)[-1]
-    # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
-    extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
-
-    # Predict Depth Maps
-    depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
-
-    # Predict Point Maps
-    point_map, point_conf = model.point_head(aggregated_tokens_list, images, ps_idx)
-        
-    # Construct 3D Points from Depth Maps and Cameras
-    # which usually leads to more accurate 3D points than point map branch
-    point_map_by_unprojection = unproject_depth_map_to_point_map(depth_map.squeeze(0), 
-                                                                extrinsic.squeeze(0), 
-                                                                intrinsic.squeeze(0))
-
-    # Predict Tracks
-    # choose your own points to track, with shape (N, 2) for one scene
-    query_points = torch.FloatTensor([[100.0, 200.0], 
-                                        [60.72, 259.94]]).to(device)
-    track_list, vis_score, conf_score = model.track_head(aggregated_tokens_list, images, ps_idx, query_points=query_points[None])
-```
-
-
-Furthermore, if certain pixels in the input frames are unwanted (e.g., reflective surfaces, sky, or water), you can simply mask them by setting the corresponding pixel values to 0 or 1. Precise segmentation masks aren't necessary - simple bounding box masks work effectively (check this [issue](https://github.com/facebookresearch/vggt/issues/47) for an example).
-
-</details>
-
-
-## Interactive Demo
-
-We provide multiple ways to visualize your 3D reconstructions. Before using these visualization tools, install the required dependencies:
-
-```bash
-pip install -r requirements_demo.txt
-```
-
-### Interactive 3D Visualization
-
-**Please note:** VGGT typically reconstructs a scene in less than 1 second. However, visualizing 3D points may take tens of seconds due to third-party rendering, independent of VGGT's processing time. The visualization is slow especially when the number of images is large.
-
-
-#### Gradio Web Interface
-
-Our Gradio-based interface allows you to upload images/videos, run reconstruction, and interactively explore the 3D scene in your browser. You can launch this in your local machine or try it on [Hugging Face](https://huggingface.co/spaces/facebook/vggt).
-
-
-```bash
-python demo_gradio.py
-```
-
-<details>
-<summary>Click to preview the Gradio interactive interface</summary>
-
-![Gradio Web Interface Preview](https://jytime.github.io/data/vggt_hf_demo_screen.png)
-</details>
-
-
-#### Viser 3D Viewer
-
-Run the following command to run reconstruction and visualize the point clouds in viser. Note this script requires a path to a folder containing images. It assumes only image files under the folder. You can set `--use_point_map` to use the point cloud from the point map branch, instead of the depth-based point cloud.
-
-```bash
-python demo_viser.py --image_folder path/to/your/images/folder
-```
-
-## Exporting to COLMAP Format
-
-We also support exporting VGGT's predictions directly to COLMAP format, by:
-
-```bash 
-# Feedforward prediction only
-python demo_colmap.py --scene_dir=/YOUR/SCENE_DIR/ 
-
-# With bundle adjustment
-python demo_colmap.py --scene_dir=/YOUR/SCENE_DIR/ --use_ba
-
-# Run with bundle adjustment using reduced parameters
-# Reduces max_query_pts from 4096 (default) to 2048 and query_frame_num from 8 (default) to 5
-# Trade-off: Potentially less robust reconstruction in complex scenes (you may consider setting query_frame_num equal to your total number of images) 
-# See demo_colmap.py for additional bundle adjustment configuration options
-python demo_colmap.py --scene_dir=/YOUR/SCENE_DIR/ --use_ba --max_query_pts=2048 --query_frame_num=5
-```
-
-Please ensure that the images are stored in `/YOUR/SCENE_DIR/images/`. This folder should contain only the images. Check the examples folder for the desired data structure. 
-
-The reconstruction result (camera parameters and 3D points) will be automatically saved under `/YOUR/SCENE_DIR/sparse/` in the COLMAP format, such as:
-
-``` 
-SCENE_DIR/
-├── images/
-└── sparse/
-    ├── cameras.bin
-    ├── images.bin
-    └── points3D.bin
-```
-
-## Integration with Gaussian Splatting
-
-
-The exported COLMAP files can be directly used with [gsplat](https://github.com/nerfstudio-project/gsplat) for Gaussian Splatting training. Install `gsplat` following their official instructions (we recommend `gsplat==1.3.0`):
-
-An example command to train the model is:
-```
-cd gsplat
-python examples/simple_trainer.py  default --data_factor 1 --data_dir /YOUR/SCENE_DIR/ --result_dir /YOUR/RESULT_DIR/
-```
-
-
-
-## Zero-shot Single-view Reconstruction
-
-Our model shows surprisingly good performance on single-view reconstruction, although it was never trained for this task. The model does not need to duplicate the single-view image to a pair, instead, it can directly infer the 3D structure from the tokens of the single view image. Feel free to try it with our demos above, which naturally works for single-view reconstruction.
-
-
-We did not quantitatively test monocular depth estimation performance ourselves, but [@kabouzeid](https://github.com/kabouzeid) generously provided a comparison of VGGT to recent methods [here](https://github.com/facebookresearch/vggt/issues/36). VGGT shows competitive or better results compared to state-of-the-art monocular approaches such as DepthAnything v2 or MoGe, despite never being explicitly trained for single-view tasks. 
-
-## Research Progression
-
-Our work builds upon a series of previous research projects. If you're interested in understanding how our research evolved, check out our previous works:
-
-
-<table border="0" cellspacing="0" cellpadding="0">
-  <tr>
-    <td align="left">
-      <a href="https://github.com/jytime/Deep-SfM-Revisited">Deep SfM Revisited</a>
-    </td>
-    <td style="white-space: pre;">──┐</td>
-    <td></td>
-  </tr>
-  <tr>
-    <td align="left">
-      <a href="https://github.com/facebookresearch/PoseDiffusion">PoseDiffusion</a>
-    </td>
-    <td style="white-space: pre;">─────►</td>
-    <td>
-      <a href="https://github.com/facebookresearch/vggsfm">VGGSfM</a> ──►
-      <a href="https://github.com/facebookresearch/vggt">VGGT</a>
-    </td>
-  </tr>
-  <tr>
-    <td align="left">
-      <a href="https://github.com/facebookresearch/co-tracker">CoTracker</a>
-    </td>
-    <td style="white-space: pre;">──┘</td>
-    <td></td>
-  </tr>
-</table>
-
-
-## Acknowledgements
-
-Thanks to these great repositories: [PoseDiffusion](https://github.com/facebookresearch/PoseDiffusion), [VGGSfM](https://github.com/facebookresearch/vggsfm), [CoTracker](https://github.com/facebookresearch/co-tracker), [DINOv2](https://github.com/facebookresearch/dinov2), [Dust3r](https://github.com/naver/dust3r), [Moge](https://github.com/microsoft/moge), [PyTorch3D](https://github.com/facebookresearch/pytorch3d), [Sky Segmentation](https://github.com/xiongzhu666/Sky-Segmentation-and-Post-processing), [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2), [Metric3D](https://github.com/YvanYin/Metric3D) and many other inspiring works in the community.
-
-## Checklist
-
-- [x] Release the training code
-- [ ] Release VGGT-500M and VGGT-200M
-
+For viser and colmap visualization, please read the original sections below.
 
 ## License
-See the [LICENSE](./LICENSE.txt) file for details about the license under which this code is made available.
-
-Please note that only this [model checkpoint](https://huggingface.co/facebook/VGGT-1B-Commercial) allows commercial usage. This new checkpoint achieves the same performance level (might be slightly better) as the original one, e.g., AUC@30: 90.37 vs. 89.98 on the Co3D dataset.
+All code is under a commercial-use-friendly license (see LICENSE.txt). Model weights and pre-trained checkpoints are licensed according to Facebook Research terms.

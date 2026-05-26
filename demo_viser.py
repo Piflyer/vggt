@@ -316,6 +316,12 @@ parser.add_argument(
     "--conf_threshold", type=float, default=25.0, help="Initial percentage of low-confidence points to filter out"
 )
 parser.add_argument("--mask_sky", action="store_true", help="Apply sky segmentation to filter out sky points")
+parser.add_argument(
+    "--checkpoint",
+    type=str,
+    default="/home/tim/vggt-cubify/vggt/training/logs/vggt_ros_subset_7400_13000_high_fidelity_test4_gamma_changed/ckpts/checkpoint.pt",
+    help="Path to the model checkpoint",
+)
 
 
 def main():
@@ -345,8 +351,26 @@ def main():
     # model = VGGT.from_pretrained("facebook/VGGT-1B")
 
     model = VGGT()
-    _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+    # _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+    # model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+    print(f"Loading checkpoint from {args.checkpoint}...")
+    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+
+    if "model" in checkpoint:
+        print("Loading state dict from 'model' key")
+        model.load_state_dict(checkpoint["model"], strict=False)
+    elif "ema_models" in checkpoint and "model" in checkpoint["ema_models"]:
+        print("Loading state dict from 'ema_models/model' key")
+        model.load_state_dict(checkpoint["ema_models"]["model"], strict=False)
+    else:
+        model.load_state_dict(checkpoint, strict=False)
+    
+    del checkpoint
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 
     model.eval()
     model = model.to(device)

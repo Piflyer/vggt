@@ -86,7 +86,7 @@ logging:
 checkpoint:
   save_dir: logs/${exp_name}/ckpts
   save_freq: 5
-  resume_checkpoint_path: /YOUR/PATH/TO/CKPT
+  resume_checkpoint_path: null
   strict: False
 
 
@@ -136,6 +136,9 @@ optim:
       - module_name: ["camera"]
         max_norm: 1.0   # feel free to reduce this if you see instabilities
         norm_type: 2
+      # - module_name: ["cubify_head"]
+      #   max_norm: 1.0   # feel free to reduce this if you see instabilities
+      #   norm_type: 2
   options:
     lr:
       - scheduler:

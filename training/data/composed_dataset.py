@@ -110,6 +110,12 @@ class ComposedDataset(Dataset, ABC):
         # Normalize images from [0, 255] to [0, 1]
         images = images.permute(0,3,1,2).to(torch.get_default_dtype()).div(255)
 
+        # Sanity check: images must have shape [S, C, H, W] where S>0
+        if images.dim() != 4:
+            raise ValueError(f"ComposedDataset: expected images tensor with 4 dims [S,C,H,W], got {tuple(images.shape)}")
+        if images.shape[0] <= 0:
+            raise ValueError("ComposedDataset: images sequence length must be > 0")
+
         # Convert other data to tensors with appropriate types
         depths = torch.from_numpy(np.stack(batch["depths"]).astype(np.float32))
         extrinsics = torch.from_numpy(np.stack(batch["extrinsics"]).astype(np.float32))
@@ -143,6 +149,9 @@ class ComposedDataset(Dataset, ABC):
             "world_points": world_points,
             "point_masks": point_masks,
         }
+
+        if "cubify_instances" in batch:
+            sample["cubify_instances"] = batch["cubify_instances"]
 
         # --- Track Processing (if enabled) ---
         if self.load_track:

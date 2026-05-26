@@ -87,23 +87,26 @@ class GradientClipper:
         Returns:
             Dictionary of gradient norms for each configuration
         """
-        if not self.is_initialized:
-            raise RuntimeError("GradientClipper must be initialized with setup_clipping() before use")
-        
-        grad_norms = {}
-        for config, params_to_clip in self.params_to_clip_by_config:
-            if not params_to_clip or config['max_norm'] is None:
-                continue
+        if self.params_to_clip_by_config is None:
+             raise RuntimeError("GradientClipper must be initialized with setup_clipping() before use")
 
-            grad_norm = nn.utils.clip_grad_norm_(
-                params_to_clip,
-                max_norm=config['max_norm'],
+        grad_norms = {}
+        # Iterate through pre-computed parameter groups
+        for config, params in self.params_to_clip_by_config:
+            # Skip if no parameters or no max norm
+            if not params or config['max_norm'] is None:
+                continue
+                
+            # Compute norm for this group
+            # We use torch.nn.utils.clip_grad_norm_ which modifies gradients in-place
+            norm = torch.nn.utils.clip_grad_norm_(
+                params, 
+                max_norm=config['max_norm'], 
                 norm_type=config['norm_type']
             )
-
-            if grad_norm is None:
-                continue
             
-            grad_norms[",".join(config['module_names'])] = grad_norm.item()
+            # Use the first module name as key for logging
+            key = ",".join(config['module_names'])
+            grad_norms[key] = norm
 
         return grad_norms

@@ -10,9 +10,11 @@ from hydra.utils import instantiate
 import random
 import numpy as np
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, IterableDataset, Sampler
+import torch.distributed as dist
 from abc import ABC, abstractmethod
 
 from .worker_fn import get_worker_init_fn
+from .collate import collate_with_cubify_instances
 
 class DynamicTorchDataset(ABC):
     def __init__(
@@ -35,7 +37,7 @@ class DynamicTorchDataset(ABC):
         self.shuffle = shuffle
         self.pin_memory = pin_memory
         self.drop_last = drop_last
-        self.collate_fn = collate_fn
+        self.collate_fn = collate_fn or collate_with_cubify_instances
         self.worker_init_fn = worker_init_fn
         self.persistent_workers = persistent_workers
         self.seed = seed
@@ -47,7 +49,6 @@ class DynamicTorchDataset(ABC):
         # Extract aspect ratio and image number ranges from the configuration
         self.aspect_ratio_range = common_config.augs.aspects  # e.g., [0.5, 1.0]
         self.image_num_range = common_config.img_nums    # e.g., [2, 24]
-
         # Validate the aspect ratio and image number ranges
         if len(self.aspect_ratio_range) != 2 or self.aspect_ratio_range[0] > self.aspect_ratio_range[1]:
             raise ValueError(f"aspect_ratio_range must be [min, max] with min <= max, got {self.aspect_ratio_range}")
@@ -55,7 +56,16 @@ class DynamicTorchDataset(ABC):
             raise ValueError(f"image_num_range must be [min, max] with 1 <= min <= max, got {self.image_num_range}")
 
         # Create samplers
-        self.sampler = DynamicDistributedSampler(self.dataset, seed=seed, shuffle=shuffle)
+        if dist.is_available() and dist.is_initialized():
+            self.sampler = DynamicDistributedSampler(self.dataset, seed=seed, shuffle=shuffle)
+        else:
+            self.sampler = DynamicDistributedSampler(
+                self.dataset,
+                num_replicas=1,
+                rank=0,
+                seed=seed,
+                shuffle=shuffle,
+            )
         self.batch_sampler = DynamicBatchSampler(
             self.sampler,
             self.aspect_ratio_range,
@@ -74,14 +84,19 @@ class DynamicTorchDataset(ABC):
         if hasattr(self.dataset, "set_epoch"):
             self.dataset.set_epoch(epoch)
 
+        has_workers = self.num_workers and self.num_workers > 0
+        prefetch_factor = 2 if has_workers else None
+        persistent_workers = self.persistent_workers if has_workers else False
+
         # Create and return the dataloader
         return DataLoader(
             self.dataset,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            prefetch_factor=prefetch_factor,
             batch_sampler=self.batch_sampler,
             collate_fn=self.collate_fn,
-            persistent_workers=self.persistent_workers,
+            persistent_workers=persistent_workers,
             worker_init_fn=get_worker_init_fn(
                 seed=self.seed,
                 num_workers=self.num_workers,
@@ -151,16 +166,23 @@ class DynamicBatchSampler(Sampler):
     def __iter__(self):
         """
         Yields batches of samples with synchronized dynamic parameters.
+        
+        Each batch is constrained to have a maximum of 32 total images across all
+        sequences in the batch. If adding a sequence would exceed this limit, the
+        current batch is yielded and a new batch is started.
 
         Returns:
             Iterator yielding batches of indices with associated parameters.
         """
         sampler_iterator = iter(self.sampler)
+        batches_yielded = 0
+        max_batches = self.__len__() // self.max_img_per_gpu  # Rough estimate
 
-        while True:
+        while batches_yielded < max_batches:
             try:
                 # Sample random image number and aspect ratio
                 random_image_num = int(np.random.choice(self.possible_nums, p=self.normalized_weights))
+                random_image_num = min(random_image_num, self.max_img_per_gpu)  # Cap it!
                 random_aspect_ratio = round(self.rng.uniform(self.aspect_ratio_range[0], self.aspect_ratio_range[1]), 2)
 
                 # Update sampler parameters
@@ -168,25 +190,62 @@ class DynamicBatchSampler(Sampler):
                     aspect_ratio=random_aspect_ratio,
                     image_num=random_image_num
                 )
-
                 # Calculate batch size based on max images per GPU and current image number
                 batch_size = self.max_img_per_gpu / random_image_num
                 batch_size = np.floor(batch_size).astype(int)
                 batch_size = max(1, batch_size)  # Ensure batch size is at least 1
 
-                # Collect samples for the current batch
+                # Collect samples for the current batch with max 32 images limit
                 current_batch = []
+                total_images_in_batch = 0
+                # max_images_per_batch = 32  # Hard limit on total images per batch
+                
                 for _ in range(batch_size):
                     try:
-                        item = next(sampler_iterator)  # item is (idx, aspect_ratio, image_num)
+                        item = next(sampler_iterator)  # item is (idx, image_num, aspect_ratio)
+                        seq_idx, img_num, aspect_ratio = item
+                        
+                        # # Check if adding this sequence would exceed 32 image limit
+                        # if total_images_in_batch + img_num > max_images_per_batch:
+                        #     # Yield current batch if it has samples, then start a new one
+                        #     if len(current_batch) > 0:
+                        #         yield current_batch
+                        #         batches_yielded += 1
+                        #         current_batch = []
+                        #         total_images_in_batch = 0
+                        
                         current_batch.append(item)
+                        total_images_in_batch += img_num
+                        
                     except StopIteration:
-                        break  # No more samples
+                        # Sampler exhausted - recreate iterator to cycle through dataset again
+                        sampler_iterator = iter(self.sampler)
+                        try:
+                            item = next(sampler_iterator)
+                            seq_idx, img_num, aspect_ratio = item
+                            
+                            # # Check limit for recycled iterator too
+                            # if total_images_in_batch + img_num > max_images_per_batch:
+                            #     if len(current_batch) > 0:
+                            #         yield current_batch
+                            #         batches_yielded += 1
+                            #         current_batch = []
+                            #         total_images_in_batch = 0
+                            
+                            current_batch.append(item)
+                            total_images_in_batch += img_num
+                        except StopIteration:
+                            # Empty dataset or other issue
+                            break
 
-                if not current_batch:
-                    break  # No more data to yield
-
+                # Only yield non-empty batches
+                if len(current_batch) == 0:
+                    # Could not collect any samples
+                    break
+                
+                # Yield the final batch (guaranteed to have at least 1 sample)
                 yield current_batch
+                batches_yielded += 1
 
             except StopIteration:
                 break  # End of sampler's iterator
@@ -200,6 +259,8 @@ class DynamicDistributedSampler(DistributedSampler):
     """
     Extends PyTorch's DistributedSampler to include dynamic aspect_ratio and image_num
     parameters, which can be passed into the dataset's __getitem__ method.
+    
+    This sampler cycles infinitely through the dataset to support unlimited training iterations.
     """
     def __init__(
         self,
@@ -220,17 +281,37 @@ class DynamicDistributedSampler(DistributedSampler):
         )
         self.aspect_ratio = None
         self.image_num = None
+        self._indices_cache = None
+
+    def _get_indices(self):
+        """Get indices for this epoch from parent class and cache them."""
+        indices_iter = super().__iter__()
+        return list(indices_iter)
 
     def __iter__(self):
         """
-        Yields a sequence of (index, image_num, aspect_ratio).
-        Relies on the parent class's logic for shuffling/distributing
-        the indices across replicas, then attaches extra parameters.
+        Yields a sequence of (index, image_num, aspect_ratio), cycling infinitely.
+        Caches indices from parent class and cycles through them.
         """
-        indices_iter = super().__iter__()
-
-        for idx in indices_iter:
+        # Get indices once per epoch
+        if self._indices_cache is None:
+            self._indices_cache = self._get_indices()
+        
+        # Cycle infinitely through the cached indices
+        idx_position = 0
+        while True:
+            if len(self._indices_cache) == 0:
+                # Edge case: empty dataset
+                break
+            
+            idx = self._indices_cache[idx_position % len(self._indices_cache)]
             yield (idx, self.image_num, self.aspect_ratio,)
+            idx_position += 1
+
+    def set_epoch(self, epoch: int):
+        """Set epoch and invalidate cache to get new shuffled indices."""
+        super().set_epoch(epoch)
+        self._indices_cache = None  # Force re-generation of indices
 
     def update_parameters(self, aspect_ratio, image_num):
         """

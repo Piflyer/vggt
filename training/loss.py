@@ -4,8 +4,11 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 import torch
 import torch.nn.functional as F
+from torchvision.ops import box_iou, sigmoid_focal_loss
+from scipy.optimize import linear_sum_assignment
 
 from dataclasses import dataclass
 from vggt.utils.pose_enc import extri_intri_to_pose_encoding
@@ -22,15 +25,17 @@ class MultitaskLoss(torch.nn.Module):
     - Camera loss
     - Depth loss 
     - Point loss
+    - Cubify loss (3D cuboid detection from Cubify Anything)
     - Tracking loss (not cleaned yet, dirty code is at the bottom of this file)
     """
-    def __init__(self, camera=None, depth=None, point=None, track=None, **kwargs):
+    def __init__(self, camera=None, depth=None, point=None, track=None, cubify=None, **kwargs):
         super().__init__()
         # Loss configuration dictionaries for each task
         self.camera = camera
         self.depth = depth
         self.point = point
         self.track = track
+        self.cubify = cubify
 
     def forward(self, predictions, batch) -> torch.Tensor:
         """
@@ -72,6 +77,15 @@ class MultitaskLoss(torch.nn.Module):
         # Tracking loss - not cleaned yet, dirty code is at the bottom of this file
         if "track" in predictions:
             raise NotImplementedError("Track loss is not cleaned up yet")
+
+        # Cubify loss - 3D cuboid supervision from Cubify Anything
+        if self.cubify is not None and "cubify" in predictions:
+            cubify_cfg = {k: v for k, v in self.cubify.items() if k != "weight"}
+            cubify_loss_dict = compute_cubify_loss(predictions, batch, **cubify_cfg)
+            cubify_weight = self.cubify.get("weight", 1.0)
+            total_loss = total_loss + cubify_loss_dict["loss_cubify"] * cubify_weight
+            loss_dict.update(cubify_loss_dict)
+            loss_dict["loss_cubify_weighted"] = cubify_loss_dict["loss_cubify"] * cubify_weight
         
         loss_dict["objective"] = total_loss
 
@@ -276,6 +290,403 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
     }
 
     return loss_dict
+
+
+def _project_world_boxes_to_2d(boxes_3d, extrinsic, intrinsic, image_size):
+    """
+    Projects 3D GeneralInstance3DBoxes (in World coordinates) to 2D normalized bounding boxes.
+    Returns boxes in [x0, y0, x1, y1] format normalized to [0, 1].
+    """
+    if boxes_3d is None or len(boxes_3d) == 0:
+        return None
+        
+    corners_3d = boxes_3d.corners # (N, 8, 3)
+    
+    # 1. World to Camera Transform
+    R = extrinsic[:3, :3]
+    t = extrinsic[:3, 3]
+    # Apply R @ p + t
+    corners_cam = torch.einsum('ij,nmj->nmi', R, corners_3d) + t
+    
+    # 2. Camera to 2D Pixel Projection
+    Z = corners_cam[..., 2].clamp(min=1e-4) # Prevent division by zero/behind camera
+    X = corners_cam[..., 0]
+    Y = corners_cam[..., 1]
+    
+    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+    
+    x_2d = (X / Z) * fx + cx
+    y_2d = (Y / Z) * fy + cy
+    
+    # 3. Get Axis-Aligned Bounding Box (AABB) from the 8 projected corners
+    
+    # Check if ANY corner is behind the camera (Z <= 0)
+    valid_z_mask = (corners_cam[..., 2] > 0).all(dim=-1) # (N,)
+    
+    if valid_z_mask.sum() == 0:
+        return None
+
+    # Filter out invalid boxes entirely or handle them gracefully? 
+    # For simplicity, let's proceed but maybe mask them later.
+    # The current implementation clamps Z which projects behind-camera points to infinity.
+    # A better approach is to simply let them be projected, but mark them invalid if Z < epsilon.
+    
+    x0 = x_2d.min(dim=-1).values
+    y0 = y_2d.min(dim=-1).values
+    x1 = x_2d.max(dim=-1).values
+    y1 = y_2d.max(dim=-1).values
+    
+    # 4. Normalize by image dimensions
+    H, W = image_size
+    
+    # Helper to sanitize coordinates
+    def sanitize_coords(c, limit):
+        # unexpected large values can occur if Z is close to 0
+        return (c / limit).clamp(min=0.0, max=1.0)
+
+    x0 = sanitize_coords(x0, W)
+    y0 = sanitize_coords(y0, H)
+    x1 = sanitize_coords(x1, W)
+    y1 = sanitize_coords(y1, H)
+    
+    # 5. Invalid boxes (behind camera) should be zeroed out or handled
+    # If the Z check above failed, the projected box is likely garbage (covering full screen or collapsed).
+    # We can use the valid_z_mask to zero out invalid boxes
+    
+    final_boxes = torch.stack([x0, y0, x1, y1], dim=-1)
+    
+    # If a box has points behind camera, its projection is technically undefined/invalid for IoU.
+    # We set it to all zeros so IoU with anything will be 0.
+    final_boxes[~valid_z_mask] = 0.0
+    
+    return final_boxes
+
+def compute_cubify_loss(
+    predictions,
+    batch,
+    max_cost: float = 1e6,
+    **kwargs,
+):
+    """
+    Cubify loss aligned to the CuTR description:
+
+    - Ground-truth assignment uses Hungarian matching over the 2D box predictions.
+    - Supervision is a corner-based Chamfer loss on the matched 3D box corners.
+    - No disentangled Chamfer terms; no NMS is assumed in this loss.
+    """
+
+    debug = bool(kwargs.get("debug", False) or os.environ.get("CUBIFY_DEBUG"))
+    assert_nonempty = bool(kwargs.get("assert_nonempty", False))
+
+    pred_instances = predictions.get("cubify", None)
+    # Try a few common keys for ground-truth instances.
+    gt_instances = None
+    for k in ["cubify_instances", "instances3d", "instances_3d", "gt_cubify"]:
+        if k in batch:
+            gt_instances = batch[k]
+            break
+
+    def _flatten_instance_list(instances):
+        if isinstance(instances, (list, tuple)) and len(instances) > 0:
+            if isinstance(instances[0], (list, tuple)):
+                flat = []
+                for sub in instances:
+                    if isinstance(sub, (list, tuple)):
+                        flat.extend(list(sub))
+                    else:
+                        flat.append(sub)
+                return flat
+        return instances
+
+    pred_instances = _flatten_instance_list(pred_instances)
+    gt_instances = _flatten_instance_list(gt_instances)
+    # Early-exit if nothing to supervise.
+    if pred_instances is None or gt_instances is None:
+        # Try to find a tensor for device/graph anchoring
+        anchor = predictions.get("pose_enc", None)
+        if anchor is None:
+            for val in predictions.values():
+                if torch.is_tensor(val):
+                    anchor = val
+                    break
+        if anchor is None:
+            anchor = torch.tensor(0.0)
+        zero = (anchor * 0).sum()
+        return {
+            "loss_cubify_corners": zero,
+            "loss_cubify": zero,
+            "cubify_matches": torch.tensor(0, device=anchor.device),
+        }
+
+    def _as_tensor_boxes_3d(instances, device):
+        """Extract GeneralInstance3DBoxes from Instances3D and move to device."""
+        if instances is None:
+            return None
+        if hasattr(instances, "get"):
+            boxes = instances.get("gt_boxes_3d") if instances.has("gt_boxes_3d") else None
+        else:
+            boxes = None
+        if boxes is None:
+            return None
+        try:
+            boxes = boxes.to(device)
+        except Exception:
+            boxes = boxes
+        return boxes
+
+    def _as_tensor_boxes_2d(instances, device, field_name):
+        if instances is None or not hasattr(instances, "has"):
+            return None
+        if not instances.has(field_name):
+            return None
+        boxes = instances.get(field_name)
+        if boxes is None:
+            return None
+        if hasattr(boxes, "tensor"):
+            boxes = boxes.tensor
+        try:
+            boxes = boxes.to(device)
+        except Exception:
+            boxes = boxes
+        return boxes
+
+    def _chamfer_distance(pred_pts, gt_pts):
+        """
+        Compute Chamfer distance between two point clouds or batches of point clouds.
+        Args:
+            pred_pts: (N, P, 3) or (P, 3)
+            gt_pts: (N, Q, 3) or (Q, 3)
+        Returns:
+            Scalar loss
+        """
+        if pred_pts.ndim == 2:
+            pred_pts = pred_pts.unsqueeze(0)
+        if gt_pts.ndim == 2:
+            gt_pts = gt_pts.unsqueeze(0)
+            
+        # pred_pts: (B, P, 3), gt_pts: (B, Q, 3)
+        dist = torch.cdist(pred_pts, gt_pts, p=2) # (B, P, Q)
+        forward = dist.min(dim=-1).values # (B, P)
+        backward = dist.min(dim=-2).values # (B, Q)
+        return forward.mean() + backward.mean()
+    
+    def _centroid_distance(pred_boxes, gt_boxes):
+        pred_centers = pred_boxes.gravity_center
+        gt_centers = gt_boxes.gravity_center.to(pred_centers.device)
+        return torch.cdist(pred_centers, gt_centers, p=2)
+    
+    # 2. Weighted Loss Components
+    total_loss_val = torch.tensor(0.0, device=pred_instances[0].pred_boxes_3d.device)
+    total_matches = 0
+    skipped_no_pred_attr = 0
+    skipped_empty_pred = 0
+    skipped_empty_gt = 0
+    skipped_missing_gt_attr = 0
+
+    # Align list lengths just in case.
+    num_frames = min(len(pred_instances), len(gt_instances))
+    
+    # Extract camera matrices for projection
+    B, S, _, H, W = batch['images'].shape
+    # Extrinsics are [B, S, 3, 4] in the batch, we need to pad them to [B, S, 4, 4]
+    extrinsics_3x4 = batch['extrinsics'].view(B * S, 3, 4)
+    extrinsics_flat = torch.eye(4, device=extrinsics_3x4.device).unsqueeze(0).repeat(B * S, 1, 1)
+    extrinsics_flat[:, :3, :] = extrinsics_3x4
+    
+    intrinsics_flat = batch['intrinsics'].view(B * S, 3, 3)
+    
+    # Weights
+    weight_center = kwargs.get("weight_center", 5.0)
+    weight_dims = kwargs.get("weight_dims", 1.0)
+    weight_cls = kwargs.get("weight_class", 2.0) # New weight for classification
+
+    from torchvision.ops import box_convert # Import for cxcywh conversion
+
+    for frame_idx in range(num_frames):
+        pred_inst = pred_instances[frame_idx]
+        gt_inst = gt_instances[frame_idx]
+
+        if not hasattr(pred_inst, "pred_boxes_3d"):
+            skipped_no_pred_attr += 1
+            continue
+
+        pred_boxes = pred_inst.pred_boxes_3d
+        pred_boxes_2d = _as_tensor_boxes_2d(pred_inst, pred_boxes.device, "pred_boxes")
+        pred_logits = getattr(pred_inst, "pred_logits", None)
+        
+        # Convert DETR's [cx, cy, w, h] to [x0, y0, x1, y1] for IoU calculation
+        if pred_boxes_2d is not None and len(pred_boxes_2d) > 0:
+            pred_boxes_2d = box_convert(pred_boxes_2d, in_fmt="cxcywh", out_fmt="xyxy")
+        elif pred_boxes_2d is None and pred_boxes is not None:
+            # If no 2D predictions, project 3D to 2D
+             extrinsic = extrinsics_flat[frame_idx].to(pred_boxes.device)
+             intrinsic = intrinsics_flat[frame_idx].to(pred_boxes.device)
+             pred_boxes_2d = _project_world_boxes_to_2d(pred_boxes, extrinsic, intrinsic, (H, W))
+
+        if len(pred_boxes) == 0:
+            skipped_empty_pred += 1
+            continue
+
+        gt_boxes = _as_tensor_boxes_3d(gt_inst, pred_boxes.device)
+        if gt_boxes is None:
+            skipped_missing_gt_attr += 1
+            continue
+        if len(gt_boxes) == 0:
+            skipped_empty_gt += 1
+            continue
+            
+        # GT might not have 2D boxes, so we don't strictly require them
+        gt_boxes_2d = _as_tensor_boxes_2d(gt_inst, pred_boxes.device, "gt_boxes")
+        
+        # NEW: If GT doesn't have 2D boxes, project them from 3D!
+        if gt_boxes_2d is None and gt_boxes is not None:
+            extrinsic = extrinsics_flat[frame_idx].to(pred_boxes.device)
+            intrinsic = intrinsics_flat[frame_idx].to(pred_boxes.device)
+            gt_boxes_2d = _project_world_boxes_to_2d(gt_boxes, extrinsic, intrinsic, (H, W))
+
+        
+        # --- COST MATRIX CONSTRUCTION ---
+        # 1. Box Distance Cost (Centroid)
+        centroid_cost = _centroid_distance(pred_boxes, gt_boxes) # [N_pred, N_gt]
+        centroid_cost = torch.nan_to_num(centroid_cost, nan=max_cost)
+        
+        # 2. IoU Cost (1 - IoU)
+        iou_cost = None
+        if pred_boxes_2d is not None and gt_boxes_2d is not None:
+             iou_matrix = box_iou(pred_boxes_2d, gt_boxes_2d) # [N_pred, N_gt]
+             iou_cost = 1.0 - iou_matrix
+             iou_cost = torch.nan_to_num(iou_cost, nan=1.0)
+        
+        # 3. Classification Cost (-Prob)
+        cls_cost = None
+        if pred_logits is not None:
+            # Assume binary classification (last dim is num_classes). Take max prob or prob of class 0.
+            # Using prob of class 0 (assuming 'cuboid' is class 0)
+            target_class_idx = 0 
+            pred_probs = pred_logits.sigmoid()
+            if pred_probs.shape[-1] > 0:
+                 prob_class = pred_probs[:, target_class_idx] # [N_pred]
+                 # Expand to [N_pred, N_gt]
+                 cls_cost = 1.0 - prob_class.unsqueeze(1).expand(-1, len(gt_boxes))
+        
+        # Combine Costs
+        # Cost = w_center * dist + w_iou * (1-iou) + w_cls * (1-prob)
+        cost_matrix = centroid_cost * weight_center
+        if iou_cost is not None:
+            cost_matrix = cost_matrix + iou_cost # IoU usually weight 1.0-2.0
+        if cls_cost is not None:
+            cost_matrix = cost_matrix + cls_cost * weight_cls
+
+        cost_matrix = torch.nan_to_num(cost_matrix, nan=max_cost, posinf=max_cost, neginf=0.0)
+        cost_matrix_np = cost_matrix.detach().cpu().numpy()
+        
+        # --- BIPARTITE MATCHING ---
+        try:
+            from scipy.optimize import linear_sum_assignment  # type: ignore
+            pred_indices_np, gt_indices_np = linear_sum_assignment(cost_matrix_np)
+            pred_indices = torch.as_tensor(pred_indices_np, device=cost_matrix.device, dtype=torch.long)
+            gt_indices = torch.as_tensor(gt_indices_np, device=cost_matrix.device, dtype=torch.long)
+        except Exception:
+            # Greedy fallback
+            pred_indices = []
+            gt_indices = []
+            cost_work = cost_matrix.detach().clone()
+            while cost_work.numel() > 0:
+                idx = torch.argmin(cost_work)
+                i = idx // cost_work.shape[1]
+                j = idx % cost_work.shape[1]
+                if cost_work[i, j] >= max_cost:
+                    break
+                pred_indices.append(i.item())
+                gt_indices.append(j.item())
+                cost_work[i, :] = max_cost
+                cost_work[:, j] = max_cost
+            if len(pred_indices) == 0:
+                continue
+            pred_indices = torch.tensor(pred_indices, device=cost_matrix.device, dtype=torch.long)
+            gt_indices = torch.tensor(gt_indices, device=cost_matrix.device, dtype=torch.long)
+
+        matches = len(pred_indices)
+        if matches == 0:
+            continue
+        total_matches += matches
+
+        # --- LOSS CALCULATION ---
+        
+        matched_pred_boxes = pred_boxes[pred_indices]
+        matched_gt_boxes = gt_boxes[gt_indices]
+        
+        # Centroid Loss
+        loss_center = F.l1_loss(matched_pred_boxes.gravity_center, matched_gt_boxes.gravity_center)
+        total_loss_val += loss_center * weight_center
+        
+        # Dimensions Loss (Disabled)
+        # loss_dims = F.l1_loss(matched_pred_boxes.tensor[:, 3:6], matched_gt_boxes.tensor[:, 3:6])
+        # total_loss_val += loss_dims * weight_dims
+        
+        # 2D IoU Loss (Disabled)
+        # if pred_boxes_2d is not None and gt_boxes_2d is not None:
+             # matched_pred_2d = pred_boxes_2d[pred_indices]
+             # matched_gt_2d = gt_boxes_2d[gt_indices]
+             
+             # Calculate pairwise IoU
+             # x1 = torch.max(matched_pred_2d[:, 0], matched_gt_2d[:, 0])
+             # y1 = torch.max(matched_pred_2d[:, 1], matched_gt_2d[:, 1])
+             # x2 = torch.min(matched_pred_2d[:, 2], matched_gt_2d[:, 2])
+             # y2 = torch.min(matched_pred_2d[:, 3], matched_gt_2d[:, 3])
+             
+             # inter_area = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
+             
+             # area_p = (matched_pred_2d[:, 2] - matched_pred_2d[:, 0]) * (matched_pred_2d[:, 3] - matched_pred_2d[:, 1])
+             # area_g = (matched_gt_2d[:, 2] - matched_gt_2d[:, 0]) * (matched_gt_2d[:, 3] - matched_gt_2d[:, 1])
+             
+             # union_area = area_p + area_g - inter_area
+             
+             # iou = inter_area / (union_area + 1e-6)
+             # loss_iou = (1.0 - iou).mean()
+             # total_loss_val += loss_iou * 2.0 # Weight for IoU
+             
+        if pred_logits is not None:
+            # Target: 1 for matched indices, 0 for everything else
+            target_labels = torch.zeros_like(pred_logits)
+            # Assign matched GT
+            target_labels[pred_indices, 0] = 1.0 
+            
+            # Focal loss on logits
+            # Use reduction='sum' and normalize by number of matches (like DETR)
+            # instead of 'mean' which dilutes the signal by N (1200) instead of M (e.g. 5)
+            loss_cls = sigmoid_focal_loss(pred_logits, target_labels, alpha=0.25, gamma=2.0, reduction='sum')
+            loss_cls_norm = loss_cls / max(matches, 1.0)
+            
+            total_loss_val += loss_cls_norm * weight_cls
+        
+        if debug and frame_idx < 5:
+            print(f"[cubify] frame={frame_idx} matches={matches} loss_batch={float(total_loss_val.detach())}")
+            
+    if total_matches > 0:
+        total_loss_val = check_and_fix_inf_nan(total_loss_val / num_frames, "loss_cubify")
+    else:
+        zero_anchor = pred_instances[0].pred_boxes_3d.tensor.sum() * 0
+        total_loss_val = zero_anchor
+
+    if debug:
+        print(
+            f"[cubify] frames={num_frames} matches={total_matches} "
+            f"skip_pred_attr={skipped_no_pred_attr} skip_pred_empty={skipped_empty_pred} "
+            f"skip_gt_empty={skipped_empty_gt} skip_gt_attr={skipped_missing_gt_attr}"
+        )
+
+    if assert_nonempty and total_matches == 0:
+        raise RuntimeError(
+            f"cubify: zero matches (frames={num_frames}, pred_empty={skipped_empty_pred}, gt_empty={skipped_empty_gt})"
+        )
+
+    return {
+        "loss_cubify_corners": total_loss_val, # Keeping key for compatibility with logging
+        "loss_cubify": total_loss_val,
+        "cubify_matches": torch.tensor(total_matches, device=total_loss_val.device),
+    }
 
 
 def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0, alpha=0.2, valid_range=-1):

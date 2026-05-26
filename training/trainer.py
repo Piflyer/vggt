@@ -27,6 +27,11 @@ import time
 from datetime import timedelta
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
+try:
+    from cubifyanything.cubify_transformer import make_cubify_transformer
+except ImportError:
+    make_cubify_transformer = None  # Optional import; only needed for cubify pretraining
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -41,6 +46,12 @@ from train_utils.general import *
 from train_utils.logging import setup_logging
 from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
 from train_utils.optimizer import construct_optimizers
+
+try:
+    from train_utils.vis_cubify import visualize_cubify_3d_batch
+except ImportError:
+    visualize_cubify_3d_batch = None
+
 
 
 class Trainer:
@@ -77,6 +88,7 @@ class Trainer:
         loss: Optional[Dict[str, Any]] = None,
         env_variables: Optional[Dict[str, Any]] = None,
         accum_steps: int = 1,
+        cubify_pretrain_path: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -120,10 +132,12 @@ class Trainer:
         self.limit_train_batches = limit_train_batches
         self.limit_val_batches = limit_val_batches
         self.seed_value = seed_value
+        self.cubify_pretrain_path = cubify_pretrain_path
         
         # 'where' tracks training progress from 0.0 to 1.0 for schedulers
         self.where = 0.0
 
+        self.ddp_enabled = True
         self._setup_device(device)
         self._setup_torch_dist_and_backend(cuda, distributed)
 
@@ -139,7 +153,8 @@ class Trainer:
         )
         set_seeds(seed_value, self.max_epochs, self.distributed_rank)
 
-        assert is_dist_avail_and_initialized(), "Torch distributed needs to be initialized before calling the trainer."
+        if self.ddp_enabled:
+            assert is_dist_avail_and_initialized(), "Torch distributed needs to be initialized before calling the trainer."
 
         # Instantiate components (model, loss, etc.)
         self._setup_components()
@@ -156,6 +171,7 @@ class Trainer:
         # Load checkpoint if available or specified
         if self.checkpoint_conf.resume_checkpoint_path is not None:
             self._load_resuming_checkpoint(self.checkpoint_conf.resume_checkpoint_path)
+        # Disabled auto-resume to avoid loading old incompatible checkpoints:
         else:   
             ckpt_path = get_resume_checkpoint(self.checkpoint_conf.save_dir)
             if ckpt_path is not None:
@@ -163,9 +179,10 @@ class Trainer:
 
         # Wrap the model with DDP
         self._setup_ddp_distributed_training(distributed, device)
-        
+
         # Barrier to ensure all processes are synchronized before starting
-        dist.barrier()
+        if self.ddp_enabled and dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
     def _setup_timers(self):
         """Initializes timers for tracking total elapsed time."""
@@ -188,7 +205,19 @@ class Trainer:
             torch.backends.cuda.matmul.allow_tf32 = cuda_conf.allow_tf32
             torch.backends.cudnn.allow_tf32 = cuda_conf.allow_tf32
 
-        # Initialize the DDP process group
+        world_size_env = os.environ.get("WORLD_SIZE")
+
+        # Initialize the DDP process group only when launched with torchrun
+        if os.environ.get("RANK") is None and world_size_env is None:
+            self.ddp_enabled = False
+            self.rank = 0
+            return
+
+        if world_size_env == "1":
+            self.ddp_enabled = False
+            self.rank = 0
+            return
+
         dist.init_process_group(
             backend=distributed_conf.backend,
             timeout=timedelta(minutes=distributed_conf.timeout_mins)
@@ -211,9 +240,16 @@ class Trainer:
             logging.info(f"Model state loaded. Missing keys: {missing or 'None'}. Unexpected keys: {unexpected or 'None'}.")
 
         # Load optimizer state if available and in training mode
-        if "optimizer" in checkpoint:
+        if "optimizer" in checkpoint and hasattr(self, "optims") and self.optims is not None:
             logging.info(f"Loading optimizer state dict (rank {self.rank})")
-            self.optims.optimizer.load_state_dict(checkpoint["optimizer"])
+            if len(self.optims) == 1:
+                state_dict = checkpoint["optimizer"]
+                if isinstance(state_dict, list):
+                    state_dict = state_dict[0]
+                self.optims[0].optimizer.load_state_dict(state_dict)
+            else:
+                for i, optim in enumerate(self.optims):
+                    optim.optimizer.load_state_dict(checkpoint["optimizer"][i])
 
         # Load training progress
         if "epoch" in checkpoint:
@@ -249,6 +285,10 @@ class Trainer:
         self.gradient_clipper = instantiate(self.optim_conf.gradient_clip)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.optim_conf.amp.enabled)
 
+        # Optional: load CubifyAnywhere weights into the cubify head for warm-start
+        if self.cubify_pretrain_path:
+            self._load_cubify_pretrain(self.cubify_pretrain_path)
+
         # Freeze specified model parameters if any
         if getattr(self.optim_conf, "frozen_module_names", None):
             logging.info(
@@ -270,12 +310,58 @@ class Trainer:
 
         logging.info("Successfully initialized training components.")
 
+    def _load_cubify_pretrain(self, ckpt_path: str) -> None:
+        """
+        Warm-start the cubify head from a CubifyAnything checkpoint.
+
+        - Loads the Cubify transformer checkpoint.
+        - Detects depth vs RGB-only model and embedding dimension.
+        - Copies matching tensors into self.model.cubify_head with strict=False.
+        """
+        if not hasattr(self.model, "cubify_head") or self.model.cubify_head is None:
+            logging.warning("cubify_pretrain_path provided but model has no cubify_head; skipping preload.")
+            return
+
+        if make_cubify_transformer is None:
+            logging.warning("cubifyanything not installed; cannot preload cubify head.")
+            return
+
+        try:
+            state = torch.load(ckpt_path, map_location="cpu")
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.warning(f"Failed to load cubify pretrain checkpoint {ckpt_path}: {exc}")
+            return
+
+        ckpt_model = state.get("model", state)
+        try:
+            backbone_dim = ckpt_model["backbone.0.patch_embed.proj.weight"].shape[0]
+            is_depth_model = any(k.startswith("backbone.0.patch_embed_depth.") for k in ckpt_model)
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.warning(f"Could not infer cubify transformer shape from checkpoint: {exc}")
+            return
+
+        ca_model = make_cubify_transformer(dimension=backbone_dim, depth_model=is_depth_model)
+        ca_model.load_state_dict(ckpt_model, strict=False)
+
+        ca_state = ca_model.state_dict()
+        target_state = self.model.cubify_head.state_dict()
+
+        mapped = {k: v for k, v in ca_state.items() if k in target_state and v.shape == target_state[k].shape}
+        missing = [k for k in target_state.keys() if k not in mapped]
+
+        load_result = self.model.cubify_head.load_state_dict(mapped, strict=False)
+        logging.info(
+            f"Loaded cubify pretrain ({len(mapped)} tensors, skipped {len(missing)});"
+            f" missing keys: {load_result.missing_keys}"
+        )
+
     def _setup_dataloaders(self):
         """Initializes train and validation datasets and dataloaders."""
         self.train_dataset = None
         self.val_dataset = None
 
-        if self.mode in ["train", "val"]:
+        # Skip validation setup if limit_val_batches is 0
+        if self.mode in ["train", "val"] and self.limit_val_batches > 0:
             self.val_dataset = instantiate(
                 self.data_conf.get('val', None), _recursive_=False
             )
@@ -290,6 +376,9 @@ class Trainer:
         """Wraps the model with DistributedDataParallel (DDP)."""
         assert isinstance(self.model, torch.nn.Module)
 
+        if not self.ddp_enabled:
+            return
+
         ddp_options = dict(
             find_unused_parameters=distributed_conf.find_unused_parameters,
             gradient_as_bucket_view=distributed_conf.gradient_as_bucket_view,
@@ -297,11 +386,17 @@ class Trainer:
             broadcast_buffers=distributed_conf.broadcast_buffers,
         )
 
+        if getattr(distributed_conf, "static_graph", False):
+            ddp_options["static_graph"] = True
+
         self.model = nn.parallel.DistributedDataParallel(
             self.model,
             device_ids=[self.local_rank] if device == "cuda" else [],
             **ddp_options,
         )
+
+        if getattr(distributed_conf, "static_graph", False) and hasattr(self.model, "_set_static_graph"):
+            self.model._set_static_graph()
 
     def save_checkpoint(self, epoch: int, checkpoint_names: Optional[List[str]] = None):
         """
@@ -343,6 +438,7 @@ class Trainer:
             epoch=epoch,
         )
 
+        model = self.model
         if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
             model = self.model.module
 
@@ -380,6 +476,7 @@ class Trainer:
             set_seeds(self.seed_value + self.epoch * 100, self.max_epochs, self.distributed_rank)
             
             dataloader = self.train_dataset.get_loader(epoch=int(self.epoch + self.distributed_rank))
+            
             self.train_epoch(dataloader)
             
             # Save checkpoint after each training epoch
@@ -495,6 +592,10 @@ class Trainer:
             if data_iter % self.logging_conf.log_freq == 0:
                 progress.display(data_iter)
 
+            # Clean up batch from GPU memory
+            del batch
+            torch.cuda.empty_cache()
+
 
         return True
 
@@ -564,9 +665,32 @@ class Trainer:
             else:
                 chunked_batches = chunk_batch_for_accum_steps(batch, accum_steps)
 
-            self._run_steps_on_batch_chunks(
-                chunked_batches, phase, loss_meters
-            )
+            try:
+                self._run_steps_on_batch_chunks(
+                    chunked_batches, phase, loss_meters
+                )
+            except RuntimeError as e:
+                # If we catch a "Loss is nan" error, we SKIP the optimizer step
+                # but allow the loop to continue to the next batch.
+                if "Loss is" in str(e) and "attempting to stop" in str(e):
+                    logging.error(f"⚠️  SKIPPING BATCH due to NaN/Inf loss: {e}")
+                    
+                    # If we haven't run backward(), scaler doesn't know about the NaNs yet.
+                    # We should manually decrease the scale factor to prevent future NaNs.
+                    current_scale = self.scaler.get_scale()
+                    self.scaler.update(new_scale=current_scale * self.scaler.get_backoff_factor())
+                    logging.info(f"Decreased scaler scale from {current_scale} to {self.scaler.get_scale()}")
+
+                    # Zero grads just in case
+                    for optim in self.optims:
+                        optim.zero_grad()
+                    
+                    # Clean up
+                    del batch, chunked_batches
+                    torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise e
 
             # compute gradient and do SGD step
             assert data_iter <= limit_train_batches  # allow for off by one errors
@@ -633,6 +757,10 @@ class Trainer:
             if data_iter % self.logging_conf.log_freq == 0:
                 progress.display(data_iter)
 
+            # Clean up batch from GPU memory
+            del batch, chunked_batches
+            torch.cuda.empty_cache()
+
         return True
 
     def _run_steps_on_batch_chunks(
@@ -661,7 +789,7 @@ class Trainer:
         for i, chunked_batch in enumerate(chunked_batches):
             ddp_context = (
                 self.model.no_sync()
-                if i < accum_steps - 1
+                if hasattr(self.model, "no_sync") and i < accum_steps - 1
                 else contextlib.nullcontext()
             )
 
@@ -682,7 +810,12 @@ class Trainer:
                 if not math.isfinite(loss.item()):
                     error_msg = f"Loss is {loss.item()}, attempting to stop training"
                     logging.error(error_msg)
-                    return
+                    # Force a dummy backward pass on 0 loss so the unscale_ check (found_inf) still runs
+                    # and the scaler state is updated, preventing "No inf checks were recorded".
+                    # However, we still want to stop or skip the step. 
+                    # If we return immediately, the subsequent scaler.step() in train_epoch() crashes.
+                    # We should probably raise an error or return a flag to break the outer loop.
+                    raise RuntimeError(error_msg)
 
                 loss /= accum_steps
                 self.scaler.scale(loss).backward()
@@ -742,14 +875,59 @@ class Trainer:
         Returns:
             A dictionary containing the computed losses.
         """
+        # Sanity checks for images tensor to catch invalid batches early
+        images_tensor = batch.get("images", None)
+        if images_tensor is None:
+            raise ValueError("Batch missing 'images' key before model forward")
+
+        if not isinstance(images_tensor, torch.Tensor):
+            raise TypeError(f"Batch 'images' must be a torch.Tensor but got {type(images_tensor)}")
+
+        if images_tensor.dim() != 5:
+            raise ValueError(f"Expected images tensor with 5 dims [B,S,C,H,W], got shape {tuple(images_tensor.shape)}")
+
+        B, S, C, H, W = images_tensor.shape
+        print(f"Batch dimensions: B={B}, S={S}, C={C}, H={H}, W={W}")
+        if B <= 0 or S <= 0:
+            # Dump some useful diagnostics
+            keys_shapes = {k: (v.shape if isinstance(v, torch.Tensor) else type(v)) for k, v in batch.items()}
+            raise ValueError(
+                f"Invalid batch dimensions before model forward: images.shape={tuple(images_tensor.shape)}; "
+                f"batch keys shapes: {keys_shapes}"
+            )
+
         # Forward pass
-        y_hat = model(images=batch["images"])
+        y_hat = model(images=images_tensor)
         
         # Loss computation
         loss_dict = self.loss(y_hat, batch)
+        if "objective" in loss_dict and "loss_objective" not in loss_dict:
+            loss_dict["loss_objective"] = loss_dict["objective"]
         
         # Combine all data for logging
         log_data = {**y_hat, **loss_dict, **batch}
+
+        # Visualize Cubify
+        if self.rank == 0 and self.steps[phase] % self.logging_conf.log_freq == 0:
+            try:
+                # Find GT instances
+                gt_inst = None
+                for k in ["cubify_instances", "instances3d", "instances_3d", "gt_cubify"]:
+                    if k in batch:
+                        gt_inst = batch[k]
+                        break
+                
+                # Visualize
+                cubify_vis = visualize_cubify_3d_batch(
+                    images=batch["images"],
+                    pred_instances=y_hat.get("cubify", None),
+                    gt_instances=gt_inst,
+                    extrinsics=batch.get("extrinsics", None),
+                    intrinsics=batch.get("intrinsics", None),
+                )
+                self.tb_writer.log_visuals(f"Visuals/{phase}/cubify_preds_3d", cubify_vis, self.steps[phase])
+            except Exception as e:
+                logging.warning(f"Failed to visualize cubify predictions: {e}")
 
         self._update_and_log_scalars(log_data, phase, self.steps[phase], loss_meters)
         self._log_tb_visuals(log_data, phase, self.steps[phase])
@@ -824,6 +1002,20 @@ def chunk_batch_for_accum_steps(batch: Mapping, accum_steps: int) -> List[Mappin
     """Splits a batch into smaller chunks for gradient accumulation."""
     if accum_steps == 1:
         return [batch]
+    
+    # Get the actual batch size from the first tensor in the batch
+    batch_size = None
+    for value in batch.values():
+        if isinstance(value, torch.Tensor):
+            batch_size = value.shape[0]
+            break
+    
+    # If batch size is smaller than accumulation steps, reduce accum_steps
+    if batch_size is not None and batch_size < accum_steps:
+        print(f"[chunk_batch_for_accum_steps] Warning: batch_size={batch_size} < accum_steps={accum_steps}, "
+              f"reducing accum_steps to {batch_size}")
+        accum_steps = batch_size
+    
     return [get_chunk_from_data(batch, i, accum_steps) for i in range(accum_steps)]
 
 def is_sequence_of_primitives(data: Any) -> bool:

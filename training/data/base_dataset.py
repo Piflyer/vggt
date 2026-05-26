@@ -123,6 +123,7 @@ class BaseDataset(Dataset):
         track=None,
         filepath=None,
         safe_bound=4,
+        extr_transformation=None,
     ):
         """
         Process a single image and its associated data.
