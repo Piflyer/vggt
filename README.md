@@ -54,7 +54,7 @@ As recommended in VGGT-Omega's training protocols, attempts to learn depth for d
 To preserve the excellent zero-shot generic geometry representations learned by the Visual Geometry Grounded Transformer, we freeze the core patch aggregator:
 ```bash
 # Add --freeze_aggregator to retain general visual representations
-python training/finetune_cubifyanything.py --freeze_aggregator ...
+python training/launch.py ....
 ```
 This forces backpropagation to exclusively adapt the lightweight tracking/camera and depth heads to the custom camera trajectory distribution, preventing catastrophic geometry forgetting.
 
