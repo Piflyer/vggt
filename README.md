@@ -51,10 +51,10 @@ Outdoor LiDAR often provides sparse points or fails on highly reflective/absorbe
 As recommended in VGGT-Omega's training protocols, attempts to learn depth for distant skies leads to massive gradient spikes. We isolate sky pixels using ONNX-based semantic masks and cap depth values at a constant background range (**50.0 meters**), directing model gradients away from unlearnable infinite space.
 
 ### C. Catastrophic Forgetting Mitigation (Feature Freezing)
-To preserve the excellent zero-shot generic geometry representations learned by the Visual Geometry Grounded Transformer, we freeze the core patch aggregator:
+To preserve the excellent zero-shot generic geometry representations learned by the Visual Geometry Grounded Transformer, the core patch aggregator is frozen via `frozen_module_names` in the YAML configuration. You can execute the training pipeline with:
 ```bash
-# Add --freeze_aggregator to retain general visual representations
-python training/launch.py ....
+cd training
+python3 launch.py --config cubifyanything_vggt_fixed
 ```
 This forces backpropagation to exclusively adapt the lightweight tracking/camera and depth heads to the custom camera trajectory distribution, preventing catastrophic geometry forgetting.
 
@@ -168,22 +168,39 @@ except RuntimeError as e:
 
 ## 4. Fine-Tuning Execution
 
-To begin fine-tuning camera tracking and depth estimation on your extracted rosbag sequences:
+To begin fine-tuning camera tracking and depth estimation on your extracted rosbag sequences, navigate to the `training/` folder and use the Hydra-backed launch wrapper:
 
-### Execution Command:
 ```bash
-python training/finetune_cubifyanything.py \
-    --checkpoint /path/to/pretrained_vggt.pth \
-    --train_tars "ml-cubifyanything/data/extracted/rosbag/*" \
-    --epochs 30 \
-    --batch_size 12 \
-    --lr 2e-5 \
-    --num_workers 4 \
-    --exp_name vggt_tracking_rosbag
+cd training
+python3 launch.py --config cubifyanything_vggt_fixed
 ```
 
-Configuration details, including batch sequences, loss weights, and frozen modules can be adjusted in:
-`training/config/cubifyanything_vggt_fixed.yaml`
+> [!TIP]
+> **Performance Benchmark**: Fine-tuning this custom sequence for **40 epochs** takes approximately **2.5 hours on an NVIDIA A6000 GPU**.
+
+### 📥 Pre-trained Model Checkpoint Setup
+Before starting any training run, you must download the pre-trained VGGT base weights (`model.pt`) and place them inside the `vggt/models/` folder to match the `resume_checkpoint_path` defined in the configuration files:
+- **Target Location**: `vggt/models/model.pt`
+- Ensure the directory is prepared before starting the training wrapper:
+  ```bash
+  mkdir -p vggt/models/
+  # Place the downloaded 'model.pt' checkpoint in this directory
+  ```
+
+### Running Without VGGT-Omega Training Enhancements (Vanilla Config)
+If you wish to run the training process *without* the VGGT-Omega optimizations, you can use the vanilla configuration file:
+- **Active Prediction Confidence Loss**: Enables standard `loss_conf_depth` weighting (setting `gamma: 1.0` and `alpha: 0.2`).
+- **Disabled Cosine Scheduling**: Employs a steady, constant learning rate scheduler rather than a decaying warm-up curve.
+
+To launch the vanilla training run:
+```bash
+cd training
+python3 launch.py --config cubifyanything_vggt_vanilla
+```
+
+Configuration details are managed inside:
+- **Omega-Optimized**: [cubifyanything_vggt_fixed.yaml](training/config/cubifyanything_vggt_fixed.yaml)
+- **Vanilla/Baseline**: [cubifyanything_vggt_vanilla.yaml](training/config/cubifyanything_vggt_vanilla.yaml)
 
 ---
 
